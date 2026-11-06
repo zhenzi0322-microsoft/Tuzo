@@ -1,0 +1,158 @@
+name: Release windows,ubuntu,macos
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '要创建 / 更新的 Release tag（手动触发时填写；tag 推送触发可留空）'
+        required: false
+        default: ''
+        type: string   # 显式声明单行文本框，网页显示输入框
+      release_body:
+        description: "Release 更新说明，可粘贴换行文本"
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: write
+jobs:
+  release_main:  # ✅ 修改job ID为 release_main，needs才能识别
+    strategy:
+      # Linux 侧首次构建可能踩到环境问题；别让它把 Windows 的发布一起取消掉，
+      # 否则一次失败会连本来没问题的 Windows 安装包也发不出去。
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --bundles nsis
+            label: Windows
+          - os: ubuntu-22.04
+            args: --bundles appimage
+            label: Linux
+          - os: macos-15
+            args: --target aarch64-apple-darwin --bundles app,dmg
+            label: macOS aarch64
+          - os: macos-15
+            args: --target x86_64-apple-darwin --bundles app,dmg
+            label: macOS x86_64
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Clone Codeup private repo into demo
+        env:
+          CODEUP_TOKEN: ${{ secrets.CODEUP_TOKEN }}
+        # 注意仓库地址保持统一
+        run: |
+          git clone "https://oauth2:${env:CODEUP_TOKEN}@codeup.aliyun.com/zheniz0322/Rust/tauri/Tuzo.git" demo
+        shell: pwsh
+      # Tauri v2 在 Linux 上编译 WebView 界面需要 webkit2gtk 4.1；
+      # 托盘图标（build_tray）需要 appindicator；打 AppImage 需要 patchelf。
+      # 包清单来自官方 v2 文档 v2.tauri.app/start/prerequisites。
+      #
+      # 历史误读：X11 桌面上“AppImage 打不开中文输入法”曾经被归因到这里的依赖缺失，
+      # 其实依赖已齐。真正原因在运行时：wry 在 set_webview_settings() 里无条件调
+      # WebKitInputMethodContext::set_enable_preedit(false)（tauri#5986 遗留规避），
+      # 直接拒送 composition 事件到 DOM。修复不在 CI，而在应用侧建窗后把开关翻回来，
+      # 详见 src-tauri/src/ime_linux.rs::enable_inline_preedit 与 lib.rs 里三处调用。
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Add macOS cross targets
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: demo
+        run: npm install
+
+      - name: Collect release notes
+        id: notes
+        shell: pwsh
+        env:
+          # 手动触发时可直接在页面上粘贴更新说明，优先于仓库里的更新日志文件
+          MANUAL_BODY: ${{ inputs.release_body }}
+        run: |
+          # 更新日志取自 Codeup 仓 docs/RELEASE_NOTES.md, 按版本分节（"## v0.2.0" 小节头），
+          # 只截取当前 tag 对应小节作为 Release body —— 应用内「检查更新」弹窗直接展示它；
+          # 文件缺失或无对应小节时回退为 tag 名。
+          $f = 'demo/docs/RELEASE_NOTES.md'
+          $tag = '${{ inputs.tag_name || github.ref_name }}'
+          $body = $null
+          if ($env:MANUAL_BODY) {
+            $body = $env:MANUAL_BODY.Trim()
+          } elseif (Test-Path $f) {
+            $inSection = $false
+            $acc = @()
+            foreach ($l in (Get-Content $f)) {
+              if ($l -match ("^##\s+" + [regex]::Escape($tag) + "\s*$")) { $inSection = $true; continue }
+              if ($inSection -and $l -match '^##\s') { break }
+              if ($inSection) { $acc += $l }
+            }
+            $body = ($acc -join "`n").Trim()
+          }
+          if (-not $body) { $body = "LYZTerm $tag" }
+          # 多行内容用 heredoc 形式写入 GITHUB_OUTPUT, 后续 releaseBody 直接引用
+          "body<<__NOTES_EOF__" >> $env:GITHUB_OUTPUT
+          $body >> $env:GITHUB_OUTPUT
+          "__NOTES_EOF__" >> $env:GITHUB_OUTPUT
+
+      # tauri-action 会：① 在 projectPath 下执行 beforeBuildCommand(npm run build)
+      # ② 打各平台的安装包（按 args 的 --bundles 覆盖）③ 上传到本次 tag 的 GitHub Release。
+      #
+      # projectPath: demo 是关键：本工作流没有 actions/checkout，源码被 clone 到
+      # 子目录 demo/ 里，而 tauri-action 默认在当前工作目录（空的 workspace 根）找工程，
+      # 不设 projectPath 会因找不到 package.json/src-tauri 直接失败。
+      #
+      # includeUpdaterJson 置 false：本应用的自动更新是「自研模块直连 GitHub Releases API」
+      # （见 src-tauri/src/update.rs，按 SemVer 匹配 *_x64-setup.exe），不使用 Tauri 内置
+      # updater，生成 latest.json / 签名毫无用处，反而因缺 createUpdaterArtifacts/签名密钥
+      # 导致该步骤报错。安装包本身仍会正常上传到 Release，正是应用 check_update 要消费的东西。
+      #
+      # args 里用 --bundles 按平台覆盖打包目标：tauri.conf.json 的
+      # `bundle.targets` 写的是 ["nsis"]（Windows 专属），若不覆盖，
+      # 在 Linux 上会尝试打 NSIS 并直接失败。
+      - name: Build & Publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          # 源码 clone 到 demo/，必须显式指向该子目录，否则在空根目录构建失败。
+          projectPath: demo
+          tagName: ${{ inputs.tag_name || github.ref_name }}
+          releaseName: "Tuzo ${{ inputs.tag_name || github.ref_name }}" # ✅ 统一名称
+          # ── 更新说明（来自 RELEASE_NOTES.md，无需手改）─────────────────────
+          # 显示在 GitHub Release 页面；应用内「发现新版本」弹窗也读取该 Release 的正文展示。
+          # 支持 Markdown（前端会渲染标题、列表、行内代码与粗体）。
+          # 内容取自上一步 Collect release notes 的 body 输出
+          # （Codeup 仓 docs/RELEASE_NOTES.md 中与当前 tag 对应的小节；
+          #  手动触发时可用 release_body 输入覆盖）。
+          releaseBody: ${{ steps.notes.outputs.body }}
+          # 本应用用自研更新，不需要 Tauri 的 latest.json / updater 签名。
+          includeUpdaterJson: false
+          # 打包目标按平台在 matrix 里定好（Windows=nsis / Linux=appimage /
+          # macOS=app+--target），这里原样透传。
+          args: ${{ matrix.args }}
